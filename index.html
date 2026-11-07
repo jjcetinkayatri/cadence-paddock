@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<title>Cadence Paddock</title>
+<style>
+:root{--bg:#FAFAFA;--surface:#fff;--divider:#E2E2E2;--text:#141414;--body:#3A3A3A;--meta:#6E6E6E;--good:#2F6A48;--bad:#B3261E;--accent:#141414;--on:#fff;color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--bg:#0C0C0C;--surface:#1A1A1A;--divider:#2E2E2E;--text:#F5F5F5;--body:#D0D0D0;--meta:#8A8A8A;--good:#5FBF8F;--bad:#E5847D;--accent:#F5F5F5;--on:#000;color-scheme:dark}}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg);color:var(--body);font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;padding:24px max(16px,env(safe-area-inset-right)) 24px max(16px,env(safe-area-inset-left))}
+main{width:100%;max-width:380px;background:var(--surface);border:1px solid var(--divider);border-radius:16px;padding:28px 24px;text-align:center}
+.brand{display:inline-flex;align-items:center;gap:9px;color:var(--text);font-family:Sora,sans-serif;font-weight:500;font-size:22px;letter-spacing:-.035em}
+h1{font-size:18px;color:var(--text);margin:18px 0 6px}
+p{font-size:14px;line-height:1.5;margin:0 0 18px;color:var(--meta)}
+input{width:100%;font:inherit;font-size:15px;color:var(--text);background:var(--bg);border:1px solid var(--divider);border-radius:10px;padding:11px 12px}
+input:focus-visible,button:focus-visible{outline:2px solid var(--good);outline-offset:2px}
+button{width:100%;margin-top:12px;font:inherit;font-weight:600;font-size:14px;background:var(--accent);color:var(--on);border:0;border-radius:10px;padding:11px 14px;cursor:pointer}
+button[disabled]{opacity:.6;cursor:default}
+label.show{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:13px;color:var(--meta);text-align:left;cursor:pointer}
+label.show input{width:auto}
+#msg{min-height:20px;margin:12px 0 0;font-size:13px;color:var(--bad)}
+#msg.ok{color:var(--meta)}
+</style>
+</head>
+<body>
+<main>
+<span class="brand"><svg viewBox="0 0 32 32" width="26" height="26" aria-hidden="true"><g stroke-width="5" stroke-linecap="round" fill="none"><line x1="4.5" y1="27" x2="9.5" y2="13" stroke="var(--meta)" opacity=".55"/><line x1="13.5" y1="23" x2="18.5" y2="9" stroke="var(--meta)" opacity=".5"/><line x1="22.5" y1="19" x2="27.5" y2="5" stroke="var(--good)"/></g></svg>cadence</span>
+<h1>Cadence Paddock</h1>
+<p>Enter the passphrase you were given. It is checked on your device and never sent anywhere.</p>
+<form id="f" autocomplete="off">
+<input id="p" type="password" placeholder="Passphrase" aria-label="Passphrase" autocapitalize="off" autocorrect="off" spellcheck="false" autofocus>
+<label class="show"><input id="s" type="checkbox"> Show what I type</label>
+<button id="b" type="submit">Open</button>
+<p id="msg" role="status"></p>
+</form>
+</main>
+<script>
+// The unlock logic, shared by the unlock page (browser) and the tests (node).
+// It runs entirely on the reader's device: the passphrase never leaves it.
+(function (g) {
+  var enc = new TextEncoder(), dec = new TextDecoder();
+  function b64d(s) { var bin = atob(s), a = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i); return a; }
+  function b64e(buf) { var a = new Uint8Array(buf), s = ''; for (var i = 0; i < a.length; i++) s += String.fromCharCode(a[i]); return btoa(s); }
+  var PAYLOAD_AAD = 'cadence-paddock-v1';
+
+  async function keyFromSlot(subtle, slot, pass, iter) {
+    try {
+      var base = await subtle.importKey('raw', enc.encode(pass), 'PBKDF2', false, ['deriveKey']);
+      var wk = await subtle.deriveKey({ name: 'PBKDF2', salt: b64d(slot.salt), iterations: iter, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
+      return new Uint8Array(await subtle.decrypt({ name: 'AES-GCM', iv: b64d(slot.iv), additionalData: enc.encode(slot.id) }, wk, b64d(slot.wrapped)));
+    } catch (e) { return null; }
+  }
+
+  async function openPayload(subtle, meta, payloadBytes, keyBytes) {
+    try {
+      var k = await subtle.importKey('raw', keyBytes, 'AES-GCM', false, ['decrypt']);
+      var plain = await subtle.decrypt({ name: 'AES-GCM', iv: b64d(meta.payloadIv), additionalData: enc.encode(PAYLOAD_AAD) }, k, payloadBytes);
+      return dec.decode(plain);
+    } catch (e) { return null; }
+  }
+
+  // Returns { ok:true, html, key } or { ok:false, reason:'invalid'|'expired'|'empty' }.
+  // At most two slow key derivations: the guest slot named by the passphrase's
+  // own prefix, and the owner slot.
+  async function unlock(subtle, meta, payloadBytes, passphrase, nowMs) {
+    var p = String(passphrase || '').trim();
+    if (!p) return { ok: false, reason: 'empty' };
+    var tries = [];
+    // A guest passphrase is six letters or digits 2-7, then five groups of four.
+    // Find it anywhere in what was typed or pasted, so a copied "Passphrase: ..."
+    // line, quotes or stray spaces do not matter.
+    var m = p.toLowerCase().match(/([a-z2-7]{6})-([a-z2-7]{4})-([a-z2-7]{4})-([a-z2-7]{4})-([a-z2-7]{4})-([a-z2-7]{4})/);
+    if (m) {
+      var gs = meta.slots.filter(function (s) { return s.kind === 'guest' && s.id === m[1]; })[0];
+      if (gs) tries.push([gs, m[0]]);
+    }
+    var os = meta.slots.filter(function (s) { return s.kind === 'owner'; })[0];
+    if (os) tries.push([os, p]);
+    var expired = false;
+    for (var i = 0; i < tries.length; i++) {
+      var slot = tries[i][0], key = await keyFromSlot(subtle, slot, tries[i][1], meta.iter);
+      if (!key) continue;
+      if (slot.exp && nowMs > slot.exp * 1000) { expired = true; continue; }
+      var html = await openPayload(subtle, meta, payloadBytes, key);
+      if (html != null) return { ok: true, html: html, key: b64e(key) };
+    }
+    return { ok: false, reason: expired ? 'expired' : 'invalid' };
+  }
+
+  async function reopen(subtle, meta, payloadBytes, keyB64) {
+    var html = await openPayload(subtle, meta, payloadBytes, b64d(keyB64));
+    return html == null ? null : html;
+  }
+
+  g.cadenceUnlock = { unlock: unlock, reopen: reopen, b64d: b64d };
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script>
+(function () {
+  var f = document.getElementById('f'), p = document.getElementById('p'), b = document.getElementById('b'), msg = document.getElementById('msg');
+  var subtle = window.crypto && window.crypto.subtle, U = window.cadenceUnlock, meta = null, payload = null;
+  function say(t, ok) { msg.textContent = t; msg.className = ok ? 'ok' : ''; }
+  function show(html) { document.open(); document.write(html); document.close(); }
+  function store(k) { try { sessionStorage.setItem('paddock-k', k); } catch (e) {} }
+  function load() {
+    return Promise.all([fetch('meta.json', { cache: 'no-store' }).then(function (r) { return r.json(); }), fetch('payload.bin', { cache: 'no-store' }).then(function (r) { return r.arrayBuffer(); })])
+      .then(function (r) { meta = r[0]; payload = r[1]; });
+  }
+  document.getElementById('s').addEventListener('change', function (e) { p.type = e.target.checked ? 'text' : 'password'; });
+  if (!subtle) { say('This browser cannot open the page (it needs a secure connection).'); b.disabled = true; return; }
+  var ready = load().then(function () {
+    var k = null; try { k = sessionStorage.getItem('paddock-k'); } catch (e) {}
+    if (!k) return;
+    return U.reopen(subtle, meta, payload, k).then(function (html) { if (html != null) show(html); else { try { sessionStorage.removeItem('paddock-k'); } catch (e) {} } });
+  }).catch(function () { say('Could not load the page. Try again in a moment.'); });
+  f.addEventListener('submit', function (e) {
+    e.preventDefault(); b.disabled = true; say('Checking...', true);
+    ready.then(function () { return U.unlock(subtle, meta, payload, p.value, Date.now()); }).then(function (r) {
+      if (r.ok) { store(r.key); show(r.html); return; }
+      b.disabled = false;
+      say(r.reason === 'expired' ? 'That access has expired. Ask for a new one.' : r.reason === 'empty' ? 'Enter a passphrase.' : 'That passphrase is not valid, or it has expired.');
+    }).catch(function () { b.disabled = false; say('Could not check the passphrase. Try again.'); });
+  });
+})();
+</script>
+</body>
+</html>
